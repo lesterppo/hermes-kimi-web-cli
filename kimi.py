@@ -180,31 +180,43 @@ def sync_profile():
 # ── Kimi chat via Playwright ──────────────────────────────
 
 def extract_response(body):
-    """Extract last AI response from Kimi page body."""
+    """Extract last AI response from Kimi page body.
+    
+    Strategy: walk backwards from "Share" marker. Chat history titles 
+    are short (<30 chars). The actual response is longer text.
+    """
     lines = body.split('\n')
-    last_share = -1
-    for i in range(len(lines)-1, -1, -1):
-        if lines[i].strip() == 'Share':
-            last_share = i; break
+    share_indices = [i for i, l in enumerate(lines) if l.strip() == 'Share']
+    if not share_indices:
+        return ''
     
-    if last_share < 0: return ''
+    last_share = share_indices[-1]
     
-    thinking = ('Thinking', 'Thought for', 'Decide', 'Retrieve', 'Add ', 'Confirm',
-                'Looking', 'The user', 'I need', 'I should', 'I can', 'But ',
-                'However', 'Actually', 'Wait', 'Let me', 'Memory')
-    candidates = []
-    for i in range(last_share+1, len(lines)):
+    # Walk backwards, collect lines until we hit something that's clearly
+    # not a chat history title (short text = sidebar, long text = response)
+    result = []
+    for i in range(last_share - 1, -1, -1):
         line = lines[i].strip()
-        if not line: continue
-        if line == "Throw me a hard one. I'm ready." or 'K2.6' in line or 'One-click' in line: break
-        candidates.append(line)
-    
-    for i in range(len(candidates)-1, -1, -1):
-        line = candidates[i]
-        if len(line) > 200 or line == 'Thinking' or any(line.startswith(p) for p in thinking) or 'memory_space' in line:
+        if not line or line == 'Copy':
             continue
-        return line
-    return candidates[-1] if candidates else ''
+        # Long lines are the actual response
+        if len(line) > 40:
+            result.insert(0, line)
+        # Short lines that are NOT UI chrome might be response snippets
+        elif len(line) > 3 and not any(line.startswith(p) for p in ('K2', 'K1', 'Ctrl')):
+            # If we already have long lines, short ones before them are 
+            # likely part of the response (e.g., code blocks, lists)
+            if result:
+                result.insert(0, line)
+            # First short line we encounter — check if it's a chat title
+            elif line not in ('New Chat', 'Chat History', 'All Chats', 'Get App',
+                              'Upgrade', 'Lock Sidebar'):
+                result.insert(0, line)
+        # Stop if we hit obvious sidebar chrome
+        if line in ('New Chat', 'Chat History', 'All Chats') and result:
+            break
+    
+    return '\n'.join(result) if result else ''
 
 def switch_model(pg, model):
     """Switch Kimi model via UI."""
