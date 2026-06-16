@@ -14,7 +14,7 @@ Usage:
   python kimi.py -c chat.json "Turn 1" && python kimi.py -c chat.json "Turn 2"
 """
 
-import os, sys, json, time, argparse, sqlite3, shutil
+import os, sys, json, time, argparse, sqlite3, shutil, re
 from pathlib import Path
 
 HOME = Path.home()
@@ -43,6 +43,25 @@ def _find_chrome_profile():
     return None
 RATE_COOLDOWN = 300
 _Q = False
+
+# Financial terms that Kimi/Qwen block — fail fast instead of hanging
+_FINANCE_KEYWORDS = [
+    'stock price', 'share price', 'market cap', 'trading at', 'dividend yield',
+    'earnings report', 'quarterly revenue', 'p/e ratio', 'balance sheet',
+    'cash flow statement', 'income statement', 'ebitda', 'eps ', 'pe ratio',
+    'nyse', 'nasdaq', 'ticker', 'etf price', 'index fund', 's&p 500',
+    'dow jones', 'ftse', 'hang seng', 'nikkei', 'stock market',
+]
+_FINANCE_TICKER_RE = re.compile(r'\$[A-Z]{1,5}\b|\b[A-Z]{1,5}\s+(?:stock|share|ticker)\b', re.IGNORECASE)
+
+def _is_finance_query(prompt: str) -> bool:
+    """Detect if a prompt is a financial query that Kimi will block."""
+    pl = prompt.lower()
+    if any(kw in pl for kw in _FINANCE_KEYWORDS):
+        return True
+    if _FINANCE_TICKER_RE.search(prompt):
+        return True
+    return False
 
 def fail(c, r):
     print(json.dumps({"ok": False, "err": c, "msg": r}, ensure_ascii=False)); sys.exit(1)
@@ -199,11 +218,13 @@ def switch_model(pg, model):
 def kimi_chat(prompt, model=DEFAULT_MODEL, conv_url=None, profile_path=None):
     from playwright.sync_api import sync_playwright
     
-    with sync_playwright() as pw:
+    pw = sync_playwright().start()
+    ctx = pg = None
+    try:
         ctx = pw.chromium.launch_persistent_context(
             profile_path, headless=True,
             viewport={'width': 1280, 'height': 800},
-            args=['--no-sandbox', '--disable-gpu'])
+            args=['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'])
         pg = ctx.pages[0] if ctx.pages else ctx.new_page()
         
         if conv_url:
@@ -218,7 +239,7 @@ def kimi_chat(prompt, model=DEFAULT_MODEL, conv_url=None, profile_path=None):
         
         editor = pg.locator('[contenteditable="true"]').first
         if editor.count() == 0:
-            ctx.close(); raise Exception("no-input")
+            raise Exception("no-input")
         
         editor.click(); time.sleep(0.5)
         editor.fill(prompt); time.sleep(0.5)
@@ -244,10 +265,16 @@ def kimi_chat(prompt, model=DEFAULT_MODEL, conv_url=None, profile_path=None):
             time.sleep(0.5)
         
         url = pg.url
-        ctx.close()
         
         if not text: raise Exception("empty-response")
         return text, url
+    finally:
+        # Clean shutdown to avoid Node.js EPIPE crashes
+        if ctx:
+            try: ctx.close()
+            except: pass
+        try: pw.stop()
+        except: pass
 
 # ── conversation ─────────────────────────────────────────
 
@@ -296,6 +323,12 @@ def main():
     prompt = args.prompt_flag or (" ".join(args.prompt) if args.prompt else None)
     if not prompt and not sys.stdin.isatty(): prompt = sys.stdin.read().strip()
     if not prompt: p.print_help(); sys.exit(1)
+    
+    # Pre-check: Kimi blocks financial queries — fail fast
+    if _is_finance_query(prompt):
+        fail("content-filter",
+            "Kimi blocks financial/stock queries. Use fin-agent-cli for stock data, "
+            "or Gemini/DeepSeek/MiniMax for financial analysis.")
     
     conv = load_conv(args.conversation) if args.conversation else {}
     if args.new: conv = {}
